@@ -21,7 +21,12 @@ import io
 app = Flask(__name__)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "controle_gastos.db")
+
+# Em produção (Render) use disco persistente:
+# Configure DB_DIR=/var/data no Render.
+DB_DIR = os.environ.get("DB_DIR", BASE_DIR)
+DB_PATH = os.path.join(DB_DIR, "controle_gastos.db")
+os.makedirs(DB_DIR, exist_ok=True)
 
 app.secret_key = os.environ.get("SECRET_KEY", "mude-esta-chave-em-producao")
 
@@ -276,13 +281,28 @@ def get_current_billing_month_key(billing_day: int) -> str:
     return billing_month_key_for_date(date.today(), billing_day)
 
 
+def prev_month_key(month_key: str) -> str:
+    y, m = map(int, month_key.split("-"))
+    m -= 1
+    if m <= 0:
+        m = 12
+        y -= 1
+    return f"{y}-{m:02d}"
+
+
+def last_n_prev_months(month_key: str, n: int):
+    out = []
+    cur = month_key
+    for _ in range(n):
+        cur = prev_month_key(cur)
+        out.append(cur)
+    return out
+
+
 # ==========================================================
 # USD/BRL exchangerate.host + CACHE
 # ==========================================================
 def fetch_usd_brl_rate_exchangerate_host() -> float:
-    """
-    Retorna BRL por 1 USD.
-    """
     url = "https://api.exchangerate.host/latest?base=USD&symbols=BRL"
     with urllib.request.urlopen(url, timeout=10) as resp:
         data = json.loads(resp.read().decode("utf-8"))
@@ -293,11 +313,6 @@ def fetch_usd_brl_rate_exchangerate_host() -> float:
 
 
 def get_usd_brl_rate_cached(max_age_seconds: int = 3600) -> float:
-    """
-    Cache em settings:
-      - usd_brl_rate
-      - usd_brl_rate_at (UTC ISO)
-    """
     migrate_db()
     now = datetime.utcnow()
 
@@ -365,13 +380,6 @@ def get_categories_for_account(account_id: int):
         return cur.fetchall()
 
 
-def get_category_by_id(account_id: int, category_id: int):
-    with closing(get_connection()) as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM categories WHERE id = ? AND account_id = ?", (category_id, account_id))
-        return cur.fetchone()
-
-
 def get_reward_rates(account_id: int):
     with closing(get_connection()) as conn:
         cur = conn.cursor()
@@ -380,13 +388,6 @@ def get_reward_rates(account_id: int):
             (account_id,),
         )
         return cur.fetchall()
-
-
-def get_reward_rate_by_id(account_id: int, rate_id: int):
-    with closing(get_connection()) as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM reward_rates WHERE id = ? AND account_id = ?", (rate_id, account_id))
-        return cur.fetchone()
 
 
 def get_reward_rate_by_brand(account_id: int, brand: str):
@@ -417,7 +418,7 @@ def get_entry_for_account(entry_id: int, account_id: int):
 
 
 # ==========================================================
-# BUDGETS (Orçamento por categoria/mês)
+# BUDGETS
 # ==========================================================
 def get_budgets_for_month(account_id: int, month_key: str):
     with closing(get_connection()) as conn:
@@ -431,11 +432,6 @@ def get_budgets_for_month(account_id: int, month_key: str):
 
 
 def upsert_budget(account_id: int, month_key: str, category: str, limit_value: float):
-    """
-    Upsert compatível com sqlite antigo:
-    - tenta INSERT
-    - se já existir, UPDATE
-    """
     now = datetime.utcnow().isoformat()
     with closing(get_connection()) as conn:
         cur = conn.cursor()
@@ -486,7 +482,7 @@ def compute_installments_remaining(entry_dict: dict, billing_day: int):
 
 
 # ==========================================================
-# SUMMARY / CHARTS
+# SUMMARY
 # ==========================================================
 def compute_summary(entries_rows, month_key, billing_day, categories):
     total_income = 0.0
@@ -565,6 +561,14 @@ def compute_monthly_stats(entries_rows, billing_day):
         points.append(round(agg[k]["points"], 2))
 
     return {"labels": labels, "income": income, "expense": expense, "balance": balance, "points": points}
+
+
+def safe_pct_change(current: float, previous: float):
+    if previous == 0:
+        if current == 0:
+            return 0.0
+        return None  # "infinito"
+    return ((current - previous) / previous) * 100.0
 
 
 # ==========================================================
@@ -699,7 +703,6 @@ def index():
     categories = [r["name"] for r in get_categories_for_account(account_id)]
     reward_rates = get_reward_rates(account_id)
 
-    # Cotação atual (cache 1h)
     try:
         usd_brl_rate = get_usd_brl_rate_cached()
     except Exception:
@@ -707,12 +710,10 @@ def index():
 
     entries_raw = get_all_entries_for_account(account_id)
 
-    # mês selecionado (mês de fatura)
     month_key = request.args.get("month") or get_current_billing_month_key(billing_day)
-
     summary = compute_summary(entries_raw, month_key, billing_day, categories)
 
-    # progresso de orçamento
+    # --------- ORÇAMENTOS (já existente) ----------
     budgets = get_budgets_for_month(account_id, month_key)
     budget_progress = []
     for cat, spent in summary["category_totals"].items():
@@ -737,7 +738,77 @@ def index():
             "status": status,
         })
 
-    # entries + parcelas restantes
+    # --------- NOVO: COMPARATIVO MÊS A MÊS ----------
+    prev_key = prev_month_key(month_key)
+    prev_summary = compute_summary(entries_raw, prev_key, billing_day, categories)
+
+    last3_keys = last_n_prev_months(month_key, 3)  # 3 anteriores
+    last3_summaries = [compute_summary(entries_raw, k, billing_day, categories) for k in last3_keys]
+    avg3_expenses = sum(s["total_expenses"] for s in last3_summaries) / 3.0
+    avg3_income = sum(s["total_income"] for s in last3_summaries) / 3.0
+
+    exp_vs_prev = summary["total_expenses"] - prev_summary["total_expenses"]
+    inc_vs_prev = summary["total_income"] - prev_summary["total_income"]
+
+    exp_vs_prev_pct = safe_pct_change(summary["total_expenses"], prev_summary["total_expenses"])
+    inc_vs_prev_pct = safe_pct_change(summary["total_income"], prev_summary["total_income"])
+
+    exp_vs_avg3 = summary["total_expenses"] - avg3_expenses
+    inc_vs_avg3 = summary["total_income"] - avg3_income
+
+    exp_vs_avg3_pct = safe_pct_change(summary["total_expenses"], avg3_expenses)
+    inc_vs_avg3_pct = safe_pct_change(summary["total_income"], avg3_income)
+
+    compare = {
+        "current_key": month_key,
+        "prev_key": prev_key,
+        "avg3_keys": last3_keys,
+        "prev": {
+            "income": prev_summary["total_income"],
+            "expenses": prev_summary["total_expenses"],
+        },
+        "avg3": {
+            "income": avg3_income,
+            "expenses": avg3_expenses,
+        },
+        "delta": {
+            "exp_vs_prev": exp_vs_prev,
+            "inc_vs_prev": inc_vs_prev,
+            "exp_vs_avg3": exp_vs_avg3,
+            "inc_vs_avg3": inc_vs_avg3,
+        },
+        "pct": {
+            "exp_vs_prev": exp_vs_prev_pct,
+            "inc_vs_prev": inc_vs_prev_pct,
+            "exp_vs_avg3": exp_vs_avg3_pct,
+            "inc_vs_avg3": inc_vs_avg3_pct,
+        }
+    }
+
+    # --------- NOVO: “ONDE VOCÊ GASTOU MAIS” ----------
+    current_cat = summary["category_totals"]
+    prev_cat = prev_summary["category_totals"]
+
+    max_spent = max(current_cat.values()) if current_cat else 0.0
+
+    cat_rank = []
+    for cat, spent in current_cat.items():
+        prev_spent = float(prev_cat.get(cat, 0.0))
+        delta = float(spent) - prev_spent
+        pct = safe_pct_change(float(spent), prev_spent)
+        bar_pct = (float(spent) / max_spent * 100.0) if max_spent > 0 else 0.0
+        cat_rank.append({
+            "category": cat,
+            "spent": float(spent),
+            "prev_spent": prev_spent,
+            "delta": delta,
+            "pct": pct,
+            "bar_pct": bar_pct,
+        })
+
+    cat_rank.sort(key=lambda x: x["spent"], reverse=True)
+
+    # Entries com parcelas restantes
     entries = []
     for row in entries_raw:
         d_row = dict(row)
@@ -759,7 +830,6 @@ def index():
     )
 
     monthly_stats = compute_monthly_stats(entries_raw, billing_day)
-
     today_str = date.today().isoformat()
 
     return render_template(
@@ -767,7 +837,6 @@ def index():
         entries=entries,
         summary=summary,
         categories=categories,
-        current_month=month_key,
         months=months,
         monthly_stats=monthly_stats,
         billing_day=billing_day,
@@ -778,6 +847,8 @@ def index():
         today_str=today_str,
         budgets=budgets,
         budget_progress=budget_progress,
+        compare=compare,
+        cat_rank=cat_rank,
     )
 
 
@@ -831,7 +902,6 @@ def budgets_page():
             field = f"budget_{cat}"
             raw = (request.form.get(field) or "").strip().replace(",", ".")
             if raw == "":
-                # vazio = sem orçamento para essa categoria neste mês
                 continue
             try:
                 val = float(raw)
@@ -1155,261 +1225,6 @@ def share_account():
 
     user = get_current_user()
     return render_template("share_account.html", user=user)
-
-
-# ==========================================================
-# ROUTES: CATEGORIES CRUD
-# ==========================================================
-@app.route("/categories", methods=["GET"])
-@login_required
-def categories_list():
-    migrate_db()
-    account_id = get_current_account_id()
-    if not account_id:
-        return redirect(url_for("logout"))
-
-    ensure_default_categories(account_id)
-    cats = get_categories_for_account(account_id)
-    return render_template("categories.html", categories=cats)
-
-
-@app.route("/categories/new", methods=["GET", "POST"])
-@login_required
-def category_new():
-    migrate_db()
-    account_id = get_current_account_id()
-    if not account_id:
-        return redirect(url_for("logout"))
-
-    ensure_default_categories(account_id)
-
-    if request.method == "POST":
-        name = (request.form.get("name") or "").strip()
-        if not name:
-            flash("Informe o nome da categoria.", "danger")
-            return redirect(url_for("category_new"))
-
-        now = datetime.utcnow().isoformat()
-        try:
-            with closing(get_connection()) as conn:
-                cur = conn.cursor()
-                cur.execute(
-                    "INSERT INTO categories (account_id, name, created_at) VALUES (?, ?, ?)",
-                    (account_id, name, now),
-                )
-                conn.commit()
-            flash("Categoria criada com sucesso.", "success")
-            return redirect(url_for("categories_list"))
-        except sqlite3.IntegrityError:
-            flash("Já existe uma categoria com esse nome.", "danger")
-            return redirect(url_for("category_new"))
-
-    return render_template("category_form.html", mode="new", category=None)
-
-
-@app.route("/categories/<int:category_id>/edit", methods=["GET", "POST"])
-@login_required
-def category_edit(category_id):
-    migrate_db()
-    account_id = get_current_account_id()
-    if not account_id:
-        return redirect(url_for("logout"))
-
-    cat = get_category_by_id(account_id, category_id)
-    if not cat:
-        flash("Categoria não encontrada.", "danger")
-        return redirect(url_for("categories_list"))
-
-    if request.method == "POST":
-        new_name = (request.form.get("name") or "").strip()
-        if not new_name:
-            flash("Informe o nome da categoria.", "danger")
-            return redirect(url_for("category_edit", category_id=category_id))
-
-        try:
-            with closing(get_connection()) as conn:
-                cur = conn.cursor()
-                cur.execute(
-                    "UPDATE categories SET name = ? WHERE id = ? AND account_id = ?",
-                    (new_name, category_id, account_id),
-                )
-                conn.commit()
-            flash("Categoria atualizada com sucesso.", "success")
-            return redirect(url_for("categories_list"))
-        except sqlite3.IntegrityError:
-            flash("Já existe uma categoria com esse nome.", "danger")
-            return redirect(url_for("category_edit", category_id=category_id))
-
-    return render_template("category_form.html", mode="edit", category=cat)
-
-
-@app.route("/categories/<int:category_id>/delete", methods=["POST"])
-@login_required
-def category_delete(category_id):
-    migrate_db()
-    account_id = get_current_account_id()
-    if not account_id:
-        return redirect(url_for("logout"))
-
-    cat = get_category_by_id(account_id, category_id)
-    if not cat:
-        flash("Categoria não encontrada.", "danger")
-        return redirect(url_for("categories_list"))
-
-    cat_name = cat["name"]
-
-    with closing(get_connection()) as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            UPDATE entries
-            SET category = 'Outros'
-            WHERE account_id = ? AND type = 'expense' AND category = ?
-            """,
-            (account_id, cat_name),
-        )
-        cur.execute("DELETE FROM categories WHERE id = ? AND account_id = ?", (category_id, account_id))
-        conn.commit()
-
-    flash("Categoria excluída. Lançamentos antigos foram movidos para 'Outros'.", "success")
-    return redirect(url_for("categories_list"))
-
-
-# ==========================================================
-# ROUTES: REWARDS CRUD (PONTUAÇÃO)
-# ==========================================================
-@app.route("/rewards", methods=["GET"])
-@login_required
-def rewards_list():
-    migrate_db()
-    account_id = get_current_account_id()
-    if not account_id:
-        return redirect(url_for("logout"))
-
-    rates = get_reward_rates(account_id)
-    return render_template("rewards.html", rates=rates)
-
-
-@app.route("/rewards/new", methods=["GET", "POST"])
-@login_required
-def reward_new():
-    migrate_db()
-    account_id = get_current_account_id()
-    if not account_id:
-        return redirect(url_for("logout"))
-
-    if request.method == "POST":
-        brand = (request.form.get("brand") or "").strip()
-        ppc_raw = (request.form.get("points_per_currency") or "").replace(",", ".").strip()
-        currency_unit = (request.form.get("currency_unit") or "BRL").upper().strip()
-        if currency_unit not in ("BRL", "USD"):
-            currency_unit = "BRL"
-
-        if not brand:
-            flash("Informe a bandeira.", "danger")
-            return redirect(url_for("reward_new"))
-
-        try:
-            ppc = float(ppc_raw)
-        except ValueError:
-            flash("Informe um número válido para pontos por moeda.", "danger")
-            return redirect(url_for("reward_new"))
-
-        if ppc < 0:
-            flash("Pontos por moeda não pode ser negativo.", "danger")
-            return redirect(url_for("reward_new"))
-
-        now = datetime.utcnow().isoformat()
-        try:
-            with closing(get_connection()) as conn:
-                cur = conn.cursor()
-                cur.execute(
-                    """
-                    INSERT INTO reward_rates (account_id, brand, points_per_currency, currency_unit, created_at)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (account_id, brand, ppc, currency_unit, now),
-                )
-                conn.commit()
-            flash("Pontuação cadastrada com sucesso.", "success")
-            return redirect(url_for("rewards_list"))
-        except sqlite3.IntegrityError:
-            flash("Essa bandeira já está cadastrada nesta conta.", "danger")
-            return redirect(url_for("reward_new"))
-
-    return render_template("reward_form.html", mode="new", rate=None)
-
-
-@app.route("/rewards/<int:rate_id>/edit", methods=["GET", "POST"])
-@login_required
-def reward_edit(rate_id):
-    migrate_db()
-    account_id = get_current_account_id()
-    if not account_id:
-        return redirect(url_for("logout"))
-
-    rate = get_reward_rate_by_id(account_id, rate_id)
-    if not rate:
-        flash("Registro de pontuação não encontrado.", "danger")
-        return redirect(url_for("rewards_list"))
-
-    if request.method == "POST":
-        brand = (request.form.get("brand") or "").strip()
-        ppc_raw = (request.form.get("points_per_currency") or "").replace(",", ".").strip()
-        currency_unit = (request.form.get("currency_unit") or (rate["currency_unit"] or "BRL")).upper().strip()
-        if currency_unit not in ("BRL", "USD"):
-            currency_unit = "BRL"
-
-        if not brand:
-            flash("Informe a bandeira.", "danger")
-            return redirect(url_for("reward_edit", rate_id=rate_id))
-
-        try:
-            ppc = float(ppc_raw)
-        except ValueError:
-            flash("Informe um número válido para pontos por moeda.", "danger")
-            return redirect(url_for("reward_edit", rate_id=rate_id))
-
-        if ppc < 0:
-            flash("Pontos por moeda não pode ser negativo.", "danger")
-            return redirect(url_for("reward_edit", rate_id=rate_id))
-
-        try:
-            with closing(get_connection()) as conn:
-                cur = conn.cursor()
-                cur.execute(
-                    """
-                    UPDATE reward_rates
-                    SET brand = ?, points_per_currency = ?, currency_unit = ?
-                    WHERE id = ? AND account_id = ?
-                    """,
-                    (brand, ppc, currency_unit, rate_id, account_id),
-                )
-                conn.commit()
-            flash("Pontuação atualizada com sucesso.", "success")
-            return redirect(url_for("rewards_list"))
-        except sqlite3.IntegrityError:
-            flash("Já existe essa bandeira cadastrada.", "danger")
-            return redirect(url_for("reward_edit", rate_id=rate_id))
-
-    return render_template("reward_form.html", mode="edit", rate=rate)
-
-
-@app.route("/rewards/<int:rate_id>/delete", methods=["POST"])
-@login_required
-def reward_delete(rate_id):
-    migrate_db()
-    account_id = get_current_account_id()
-    if not account_id:
-        return redirect(url_for("logout"))
-
-    with closing(get_connection()) as conn:
-        cur = conn.cursor()
-        cur.execute("DELETE FROM reward_rates WHERE id = ? AND account_id = ?", (rate_id, account_id))
-        conn.commit()
-
-    flash("Pontuação removida com sucesso.", "success")
-    return redirect(url_for("rewards_list"))
 
 
 # ==========================================================
