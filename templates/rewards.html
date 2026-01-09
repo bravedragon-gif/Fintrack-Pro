@@ -1,0 +1,52 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Pontuação</title>
+</head>
+<body>
+  <h2>Pontuação por bandeira</h2>
+
+  <p>
+    <a href="{{ url_for('index') }}">Voltar</a> |
+    <a href="{{ url_for('reward_new') }}">+ Nova bandeira</a>
+  </p>
+
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+      <ul>
+        {% for category, message in messages %}
+          <li><strong>{{ category }}</strong>: {{ message }}</li>
+        {% endfor %}
+      </ul>
+    {% endif %}
+  {% endwith %}
+
+  <table border="1" cellpadding="8" cellspacing="0">
+    <thead>
+      <tr>
+        <th>Bandeira</th>
+        <th>Pontos por R$</th>
+        <th>Ações</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in rates %}
+      <tr>
+        <td>{{ r.brand }}</td>
+        <td>{{ "%.4f"|format(r.points_per_currency) }}</td>
+        <td>
+          <a href="{{ url_for('reward_edit', rate_id=r.id) }}">Editar</a>
+          <form method="post" action="{{ url_for('reward_delete', rate_id=r.id) }}" style="display:inline;">
+            <button type="submit" onclick="return confirm('Remover esta pontuação?')">Excluir</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+      {% if rates|length == 0 %}
+      <tr><td colspan="3">Nenhuma bandeira cadastrada.</td></tr>
+      {% endif %}
+    </tbody>
+  </table>
+</body>
+</html>
