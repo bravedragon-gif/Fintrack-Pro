@@ -27,9 +27,15 @@
     .muted{color:#6b7280;font-size:12px}
     .flash{padding:10px 12px;border-radius:12px;margin:10px 0;border:1px solid #eaeaf1;background:#fff}
     .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+    .grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}
+    .tag{display:inline-flex;align-items:center;gap:6px;border:1px solid #e6e6ef;border-radius:999px;padding:6px 10px;font-size:12px;background:#fff}
+    .delta-pos{color:#be123c;font-weight:800}   /* mais gasto = vermelho */
+    .delta-neg{color:#047857;font-weight:800}   /* menos gasto = verde */
+    .barwrap{height:12px;border-radius:999px;background:#eee;overflow:hidden}
+    .bar{height:12px;background:#6d5efc}
     @media (max-width:980px){
       .kpis{grid-template-columns:repeat(2,1fr)}
-      .grid2{grid-template-columns:1fr}
+      .grid2,.grid3{grid-template-columns:1fr}
     }
   </style>
 </head>
@@ -103,6 +109,132 @@
 
     <div style="height:14px"></div>
 
+    <!-- ✅ NOVO: COMPARATIVO + ONDE GASTOU MAIS -->
+    <div class="grid2">
+
+      <div class="card">
+        <h3>📊 Comparativo mês a mês</h3>
+
+        <div class="row" style="margin-bottom:10px">
+          <span class="tag"><b>Atual:</b> {{ compare.current_key }}</span>
+          <span class="tag"><b>Passado:</b> {{ compare.prev_key }}</span>
+          <span class="tag"><b>Média 3:</b> {{ compare.avg3_keys[2] }}, {{ compare.avg3_keys[1] }}, {{ compare.avg3_keys[0] }}</span>
+        </div>
+
+        <div class="grid2">
+          <div class="card" style="box-shadow:none">
+            <h3 style="margin:0 0 6px 0">Gastos</h3>
+            <div class="muted">Atual: <b>R$ {{ "%.2f"|format(summary.total_expenses) }}</b></div>
+
+            <div class="muted" style="margin-top:6px">
+              vs mês passado ({{ compare.prev_key }}):
+              {% set d = compare.delta.exp_vs_prev %}
+              <b class="{{ 'delta-pos' if d>0 else 'delta-neg' if d<0 else '' }}">
+                {{ "R$ %.2f"|format(d) }}
+              </b>
+              {% if compare.pct.exp_vs_prev is not none %}
+                <span class="muted">({{ "%.1f"|format(compare.pct.exp_vs_prev) }}%)</span>
+              {% else %}
+                <span class="muted">(sem base)</span>
+              {% endif %}
+            </div>
+
+            <div class="muted" style="margin-top:6px">
+              vs média últimos 3:
+              {% set d2 = compare.delta.exp_vs_avg3 %}
+              <b class="{{ 'delta-pos' if d2>0 else 'delta-neg' if d2<0 else '' }}">
+                {{ "R$ %.2f"|format(d2) }}
+              </b>
+              {% if compare.pct.exp_vs_avg3 is not none %}
+                <span class="muted">({{ "%.1f"|format(compare.pct.exp_vs_avg3) }}%)</span>
+              {% else %}
+                <span class="muted">(sem base)</span>
+              {% endif %}
+            </div>
+          </div>
+
+          <div class="card" style="box-shadow:none">
+            <h3 style="margin:0 0 6px 0">Renda</h3>
+            <div class="muted">Atual: <b>R$ {{ "%.2f"|format(summary.total_income) }}</b></div>
+
+            <div class="muted" style="margin-top:6px">
+              vs mês passado:
+              {% set di = compare.delta.inc_vs_prev %}
+              <b class="{{ 'delta-neg' if di>0 else 'delta-pos' if di<0 else '' }}">
+                {{ "R$ %.2f"|format(di) }}
+              </b>
+              {% if compare.pct.inc_vs_prev is not none %}
+                <span class="muted">({{ "%.1f"|format(compare.pct.inc_vs_prev) }}%)</span>
+              {% else %}
+                <span class="muted">(sem base)</span>
+              {% endif %}
+            </div>
+
+            <div class="muted" style="margin-top:6px">
+              vs média últimos 3:
+              {% set di2 = compare.delta.inc_vs_avg3 %}
+              <b class="{{ 'delta-neg' if di2>0 else 'delta-pos' if di2<0 else '' }}">
+                {{ "R$ %.2f"|format(di2) }}
+              </b>
+              {% if compare.pct.inc_vs_avg3 is not none %}
+                <span class="muted">({{ "%.1f"|format(compare.pct.inc_vs_avg3) }}%)</span>
+              {% else %}
+                <span class="muted">(sem base)</span>
+              {% endif %}
+            </div>
+          </div>
+        </div>
+
+        <div class="muted" style="margin-top:10px">
+          * Para gastos: positivo = você gastou mais (vermelho). Negativo = gastou menos (verde).
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>🏆 Onde você gastou mais ({{ summary.month_key }})</h3>
+        <div class="muted" style="margin-bottom:8px">Top categorias do mês + comparação com {{ compare.prev_key }}</div>
+
+        {% for c in cat_rank[:8] %}
+          <div style="margin:10px 0">
+            <div style="display:flex;justify-content:space-between;gap:10px;align-items:center">
+              <b>{{ c.category }}</b>
+              <span class="muted">
+                R$ {{ "%.2f"|format(c.spent) }}
+                {% if c.delta != 0 %}
+                  <span class="{{ 'delta-pos' if c.delta>0 else 'delta-neg' }}">
+                    ({{ "↑" if c.delta>0 else "↓" }} R$ {{ "%.2f"|format(c.delta|abs) }})
+                  </span>
+                {% else %}
+                  <span class="muted">(=)</span>
+                {% endif %}
+              </span>
+            </div>
+
+            <div class="barwrap" style="margin-top:6px">
+              <div class="bar" style="width: {{ "%.2f"|format(c.bar_pct) }}%"></div>
+            </div>
+
+            <div class="muted" style="margin-top:4px">
+              mês passado: R$ {{ "%.2f"|format(c.prev_spent) }}
+              {% if c.pct is not none %}
+                • variação: {{ "%.1f"|format(c.pct) }}%
+              {% else %}
+                • variação: sem base
+              {% endif %}
+            </div>
+          </div>
+        {% endfor %}
+
+        {% if cat_rank|length == 0 %}
+          <div class="muted">Sem despesas no mês.</div>
+        {% endif %}
+      </div>
+
+    </div>
+
+    <div style="height:14px"></div>
+
+    <!-- (Mantive aqui seu orçamento e novo lançamento como você já tinha) -->
     <div class="grid2">
 
       <div class="card">
@@ -128,9 +260,8 @@
             </div>
 
             {% if b.limit %}
-              <div style="height:12px;border-radius:999px;background:#eee;overflow:hidden;margin-top:6px">
-                <div style="
-                  height:12px;
+              <div class="barwrap" style="margin-top:6px">
+                <div class="bar" style="
                   width: {{ 100 if b.pct > 100 else b.pct }}%;
                   background: {% if b.status=='over' %} #ff3b5c {% elif b.status=='warn' %} #f59e0b {% else %} #10b981 {% endif %};
                 "></div>
