@@ -302,17 +302,35 @@ def last_n_prev_months(month_key: str, n: int):
 # ==========================================================
 # USD/BRL exchangerate.host + CACHE
 # ==========================================================
-def fetch_usd_brl_rate_exchangerate_host() -> float:
-    url = "https://api.exchangerate.host/latest?base=USD&symbols=BRL"
-    with urllib.request.urlopen(url, timeout=10) as resp:
+# ==========================================================
+# USD/BRL - OPÇÃO B (AwesomeAPI) + CACHE
+# ==========================================================
+def fetch_usd_brl_rate_awesomeapi() -> float:
+    """
+    AwesomeAPI (Economia) - USD/BRL
+    Endpoint: https://economia.awesomeapi.com.br/json/last/USD-BRL
+
+    Retorna JSON com chave 'USDBRL', e usamos o campo 'bid' (compra).
+    """
+    url = "https://economia.awesomeapi.com.br/json/last/USD-BRL"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=10) as resp:
         data = json.loads(resp.read().decode("utf-8"))
-    rate = (data.get("rates") or {}).get("BRL")
-    if rate is None:
-        raise RuntimeError("Resposta sem rates.BRL")
-    return float(rate)
+
+    usdb = data.get("USDBRL") or {}
+    bid = usdb.get("bid")
+    if bid is None:
+        raise RuntimeError("Resposta da AwesomeAPI sem USDBRL.bid")
+
+    return float(str(bid).replace(",", "."))
 
 
 def get_usd_brl_rate_cached(max_age_seconds: int = 3600) -> float:
+    """
+    Cache em settings:
+    - usd_brl_rate
+    - usd_brl_rate_at (ISO datetime UTC)
+    """
     migrate_db()
     now = datetime.utcnow()
 
@@ -342,7 +360,8 @@ def get_usd_brl_rate_cached(max_age_seconds: int = 3600) -> float:
         if (now - last_at).total_seconds() < max_age_seconds:
             return last_rate
 
-    rate = fetch_usd_brl_rate_exchangerate_host()
+    # 🔥 OPÇÃO B: AwesomeAPI
+    rate = fetch_usd_brl_rate_awesomeapi()
 
     with closing(get_connection()) as conn:
         cur = conn.cursor()
